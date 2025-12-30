@@ -4,7 +4,6 @@ import tkinter as tk
 from tkinter import messagebox
 import json
 import os
-from pypinyin import lazy_pinyin
 import sys
 
 # 核心配置
@@ -13,291 +12,330 @@ client_socket = None
 current_username = ""
 is_running = True
 
-# 新增：全局变量声明（解决input_entry引用问题）
-input_entry = None  # 消息输入框全局变量
+# 全局UI变量
+root = None
 username_entry = None
 target_entry = None
+input_entry = None
 chat_text = None
 friend_listbox = None
 connect_btn = None
 send_btn = None
 friend_req_btn = None
+query_btn = None
+chat_title_label = None  # 新增：聊天对象标题
+
+# 新增：聊天记录管理（按好友存储）
+chat_records = {}  # 格式：{好友名: ["消息1", "消息2"]}
+current_chat_target = ""  # 当前聊天对象
 
 # 通讯录配置
-FRIENDS_FILE = "E:\\LanChatSystem\\friends.json"
+FRIENDS_FILE = "friends.json"
 friends_list = []
 
 
-# ---------------------- 自动获取本地IP ----------------------
+# 自动获取本地IP
 def get_local_ip():
-    """自动获取当前电脑的局域网IPv4地址"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
         s.close()
         return local_ip
-    except Exception:
-        try:
-            import netifaces
-            for interface in netifaces.interfaces():
-                addrs = netifaces.ifaddresses(interface)
-                if netifaces.AF_INET in addrs:
-                    for addr in addrs[netifaces.AF_INET]:
-                        ip = addr["addr"]
-                        if not ip.startswith("127.") and not ip.startswith("169.254."):
-                            return ip
-            for interface in netifaces.interfaces():
-                addrs = netifaces.ifaddresses(interface)
-                if netifaces.AF_INET in addrs:
-                    for addr in addrs[netifaces.AF_INET]:
-                        ip = addr["addr"]
-                        if not ip.startswith("127."):
-                            return ip
-        except:
-            pass
+    except:
         return "127.0.0.1"
 
 
-# ---------------------- 通讯录工具函数 ----------------------
+# 通讯录核心函数
 def init_friends_file():
-    """初始化通讯录文件"""
     if not os.path.exists(FRIENDS_FILE):
         with open(FRIENDS_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, ensure_ascii=False, indent=2)
+            json.dump({}, f, ensure_ascii=False)
 
 
 def load_friends():
-    """加载通讯录（按拼音排序）"""
-    global friends_list
-    if not os.path.exists(FRIENDS_FILE):
-        init_friends_file()
+    global friends_list, chat_records
+    init_friends_file()
     with open(FRIENDS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     friends_list = data.get(current_username, [])
-    # 拼音首字母排序
-    friends_list = sorted(friends_list, key=lambda x: lazy_pinyin(x)[0][0])
+    friends_list = sorted(friends_list)
+    # 初始化聊天记录（新好友默认空记录）
+    for friend in friends_list:
+        if friend not in chat_records:
+            chat_records[friend] = []
     update_friend_list()
 
 
 def save_friends():
-    """保存通讯录到文件"""
+    init_friends_file()
     with open(FRIENDS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     data[current_username] = friends_list
     with open(FRIENDS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False)
 
 
 def update_friend_list():
-    """更新通讯录GUI显示"""
     friend_listbox.delete(0, tk.END)
     for friend in friends_list:
         friend_listbox.insert(tk.END, friend)
 
 
-# ---------------------- 核心功能函数 ----------------------
+# 新增：切换聊天对象
+def switch_chat_target(target_friend):
+    global current_chat_target
+    # 更新当前聊天对象
+    current_chat_target = target_friend
+    # 更新标题和目标输入框
+    chat_title_label.config(text=f"当前聊天：{target_friend}")
+    target_entry.delete(0, tk.END)
+    target_entry.insert(0, target_friend)
+    # 清空当前聊天框，加载该好友的历史记录
+    chat_text.config(state=tk.NORMAL)
+    chat_text.delete(1.0, tk.END)
+    if target_friend in chat_records:
+        for record in chat_records[target_friend]:
+            chat_text.insert(tk.END, f"{record}\n")
+    chat_text.config(state=tk.DISABLED)
+    chat_text.see(tk.END)
+
+
+# 新增：添加聊天记录
+def add_chat_record(sender, content, is_self=False):
+    # 格式化消息
+    if is_self:
+        msg_format = f"[我] {content}"
+    else:
+        msg_format = f"[{sender}] {content}"
+
+    # 存储到对应好友的聊天记录
+    if sender in chat_records:
+        chat_records[sender].append(msg_format)
+    else:
+        chat_records[sender] = [msg_format]
+
+    # 如果当前正在聊这个好友，实时显示
+    if current_chat_target == sender:
+        chat_text.config(state=tk.NORMAL)
+        chat_text.insert(tk.END, f"{msg_format}\n")
+        chat_text.config(state=tk.DISABLED)
+        chat_text.see(tk.END)
+
+
+# 核心功能函数（修改消息接收逻辑）
 def recv_msg():
-    """接收服务端消息"""
+    global friends_list
     while is_running:
         try:
-            client_socket.settimeout(1.0)
+            client_socket.settimeout(3000.0)
             msg = client_socket.recv(1024).decode("utf-8")
             if msg:
-                # 处理好友申请
+                # 好友申请
                 if msg.startswith("friend_req|"):
                     req_sender = msg.split("|")[1]
-                    res = messagebox.askyesno("好友申请", f"{req_sender} 请求添加你为好友，是否同意？")
-                    reply = "同意" if res else "拒绝"
-                    client_socket.send(f"friend_reply|{req_sender}|{reply}".encode("utf-8"))
-                    # 同意则添加到通讯录
-                    if res:
+                    if not isinstance(friends_list, list):
+                        friends_list = []
+                    if messagebox.askyesno("好友申请", f"{req_sender} 请求加好友？"):
+                        client_socket.send(f"friend_reply|{req_sender}|同意".encode("utf-8"))
                         if req_sender not in friends_list:
                             friends_list.append(req_sender)
-                            friends_list = sorted(friends_list, key=lambda x: lazy_pinyin(x)[0][0])
+                            friends_list = sorted(friends_list)
+                            chat_records[req_sender] = []  # 初始化新好友聊天记录
                             save_friends()
                             update_friend_list()
-                            messagebox.showinfo("成功", f"已添加{req_sender}为好友！")
-                # 处理好友回复
+                            messagebox.showinfo("成功", f"已添加{req_sender}为好友")
+                    else:
+                        client_socket.send(f"friend_reply|{req_sender}|拒绝".encode("utf-8"))
+                # 好友回复
                 elif msg.startswith("friend_reply|"):
                     parts = msg.split("|")
-                    reply_sender = parts[1]
-                    reply_result = parts[2]
-                    if reply_result == "同意":
-                        if reply_sender not in friends_list:
-                            friends_list.append(reply_sender)
-                            friends_list = sorted(friends_list, key=lambda x: lazy_pinyin(x)[0][0])
+                    sender = parts[1]
+                    res = parts[2]
+                    if res == "同意":
+                        if sender not in friends_list:
+                            friends_list.append(sender)
+                            friends_list = sorted(friends_list)
+                            chat_records[sender] = []  # 初始化新好友聊天记录
                             save_friends()
                             update_friend_list()
-                            messagebox.showinfo("成功", f"{reply_sender} 同意了你的好友申请！")
+                            messagebox.showinfo("成功", f"{sender} 同意加好友")
                     else:
-                        messagebox.showinfo("提示", f"{reply_sender} 拒绝了你的好友申请！")
-                # 普通消息/系统提示
+                        messagebox.showinfo("提示", f"{sender} 拒绝加好友")
+                # 在线用户查询结果
+                elif msg.startswith("user_list|"):
+                    online_list = msg.split("|")[1].split(",") if msg.split("|")[1] else []
+                    msgbox_text = "当前在线用户：\n" + "\n".join(online_list) if online_list else "暂无在线用户"
+                    messagebox.showinfo("在线用户", msgbox_text)
+                # 普通消息（按发送方分聊天窗口）
                 else:
-                    chat_text.config(state=tk.NORMAL)
-                    chat_text.insert(tk.END, f"{msg}\n")
-                    chat_text.config(state=tk.DISABLED)
-                    chat_text.see(tk.END)
+                    # 解析发送方（格式：[user1] 你好）
+                    if msg.startswith("[") and "]" in msg:
+                        sender = msg[1:msg.index("]")]
+                        content = msg[msg.index("]") + 2:]
+                        # 添加到对应好友的聊天记录
+                        add_chat_record(sender, content, is_self=False)
+                    else:
+                        # 系统提示（直接显示）
+                        chat_text.config(state=tk.NORMAL)
+                        chat_text.insert(tk.END, f"{msg}\n")
+                        chat_text.config(state=tk.DISABLED)
+                        chat_text.see(tk.END)
         except socket.timeout:
             continue
         except Exception as e:
             if is_running:
-                messagebox.showerror("错误", f"与服务端断开连接：{e}")
+                messagebox.showerror("错误", f"连接断开：{e}")
             break
 
 
+# 发送消息（修改：关联当前聊天对象）
 def send_msg():
-    """发送文字消息"""
-    target_user = target_entry.get().strip()
+    target = target_entry.get().strip()
     content = input_entry.get().strip()
-    if not target_user or not content:
-        messagebox.warning("提示", "目标用户名和消息内容不能为空！")
+    if not target or not content:
+        messagebox.warning("提示", "目标/内容不能为空")
         return
-
+    if target not in friends_list:
+        messagebox.warning("提示", "仅可向通讯录好友发送消息！")
+        return
     try:
-        msg = f"text|{target_user}|{content}"
-        client_socket.send(msg.encode("utf-8"))
+        client_socket.send(f"text|{target}|{content}".encode("utf-8"))
         input_entry.delete(0, tk.END)
-        # 显示自己发送的消息
-        chat_text.config(state=tk.NORMAL)
-        chat_text.insert(tk.END, f"[我] {content}\n")
-        chat_text.config(state=tk.DISABLED)
-        chat_text.see(tk.END)
+        # 添加到当前好友的聊天记录
+        add_chat_record(target, content, is_self=True)
     except Exception as e:
-        messagebox.showerror("错误", f"消息发送失败：{e}")
+        messagebox.showerror("错误", f"发送失败：{e}")
 
 
+# 发起好友申请
 def send_friend_req():
-    """发起好友申请"""
-    target_user = target_entry.get().strip()
-    if not target_user or target_user == current_username:
-        messagebox.warning("提示", "目标用户名无效！")
+    target = target_entry.get().strip()
+    if not target or target == current_username:
+        messagebox.warning("提示", "目标无效")
         return
     try:
-        msg = f"friend_req|{target_user}|apply"
-        client_socket.send(msg.encode("utf-8"))
+        client_socket.send(f"friend_req|{target}|apply".encode("utf-8"))
     except Exception as e:
-        messagebox.showerror("错误", f"发送好友申请失败：{e}")
+        messagebox.showerror("错误", f"申请失败：{e}")
 
 
+# 查询在线用户
+def query_online_users():
+    try:
+        client_socket.send("user_query|none|none".encode("utf-8"))
+    except Exception as e:
+        messagebox.showerror("错误", f"查询失败：{e}")
+
+
+# 连接服务端
 def connect_server(server_ip):
-    """连接服务端（接收动态IP参数）"""
     global client_socket, current_username
     current_username = username_entry.get().strip()
     if not current_username:
-        messagebox.warning("提示", "请输入用户名！")
+        messagebox.warning("提示", "请输入用户名")
         return
-
     try:
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client_socket.connect((server_ip, SERVER_PORT))
         client_socket.send(current_username.encode("utf-8"))
-        messagebox.showinfo("成功", f"连接服务端 {server_ip}:{SERVER_PORT} 成功！")
+        messagebox.showinfo("成功", f"连接 {server_ip}:{SERVER_PORT} 成功")
 
         # 启动接收线程
-        recv_thread = threading.Thread(target=recv_msg)
-        recv_thread.daemon = True
-        recv_thread.start()
+        t = threading.Thread(target=recv_msg)
+        t.daemon = True
+        t.start()
 
         # 启用功能按钮
         connect_btn.config(state=tk.DISABLED)
         send_btn.config(state=tk.NORMAL)
         friend_req_btn.config(state=tk.NORMAL)
-        # 加载通讯录
+        query_btn.config(state=tk.NORMAL)
         load_friends()
     except Exception as e:
-        messagebox.showerror("错误", f"连接服务端 {server_ip}:{SERVER_PORT} 失败：{e}")
+        messagebox.showerror("错误", f"连接失败：{e}")
 
 
-# ---------------------- 优雅退出 ----------------------
+# 优雅退出
 def on_closing():
-    """窗口关闭时的优雅退出"""
-    global is_running, client_socket
-    if messagebox.askokcancel("退出", "确定要退出吗？"):
+    if messagebox.askokcancel("退出", "确定退出？"):
+        global is_running
         is_running = False
-        # 关闭socket连接
         if client_socket:
-            try:
-                client_socket.close()
-                print("✅ 客户端Socket已关闭")
-            except:
-                pass
-        # 销毁窗口并退出
+            client_socket.close()
         root.destroy()
         sys.exit(0)
 
 
-# ---------------------- 图形界面 ----------------------
+# 极简UI（新增聊天切换功能）
 def main():
-    global root
+    global root, username_entry, target_entry, input_entry, chat_text, friend_listbox
+    global connect_btn, send_btn, friend_req_btn, query_btn, chat_title_label
 
+    # 主窗口
     root = tk.Tk()
-    root.title("局域网简易聊天客户端")
-    root.geometry("600x500")
+    root.title("局域网聊天系统")
+    root.geometry("600x480")
     root.resizable(False, False)
-
-    # 绑定窗口关闭事件
     root.protocol("WM_DELETE_WINDOW", on_closing)
-    # 初始化通讯录文件
-    init_friends_file()
 
-    # 1. 服务端IP输入区（自动填充本地IP）
-    tk.Label(root, text="服务端IP：").place(x=20, y=10)
-    server_ip_entry = tk.Entry(root, width=20)
-    server_ip_entry.insert(0, get_local_ip())  # 默认填充自动识别的IP
-    server_ip_entry.place(x=80, y=10)
+    # 1. 服务端IP + 用户名（顶部）
+    tk.Label(root, text="服务端IP：").place(x=10, y=10)
+    server_ip_entry = tk.Entry(root, width=15)
+    server_ip_entry.insert(0, get_local_ip())
+    server_ip_entry.place(x=70, y=10)
 
-    # 2. 用户名输入区
-    tk.Label(root, text="用户名：").place(x=20, y=40)
-    global username_entry
-    username_entry = tk.Entry(root, width=20)
-    username_entry.place(x=80, y=40)
-    # 连接按钮（传服务端IP参数）
-    global connect_btn
-    connect_btn = tk.Button(root, text="连接服务端", command=lambda: connect_server(server_ip_entry.get().strip()))
-    connect_btn.place(x=250, y=38)
+    tk.Label(root, text="用户名：").place(x=200, y=10)
+    username_entry = tk.Entry(root, width=15)
+    username_entry.place(x=250, y=10)
 
-    # 3. 目标用户输入区
-    tk.Label(root, text="目标用户：").place(x=20, y=80)
-    global target_entry
-    target_entry = tk.Entry(root, width=20)
-    target_entry.place(x=80, y=80)
-    # 好友申请按钮
-    global friend_req_btn
-    friend_req_btn = tk.Button(root, text="发起好友申请", command=send_friend_req, state=tk.DISABLED)
-    friend_req_btn.place(x=250, y=78)
+    connect_btn = tk.Button(root, text="连接", command=lambda: connect_server(server_ip_entry.get().strip()))
+    connect_btn.place(x=380, y=8)
 
-    # 4. 聊天记录显示区
-    global chat_text
-    chat_text = tk.Text(root, state=tk.DISABLED, width=55, height=22)
-    chat_text.place(x=20, y=110)
+    # 2. 目标用户 + 功能按钮（上中）
+    tk.Label(root, text="目标用户：").place(x=10, y=40)
+    target_entry = tk.Entry(root, width=15)
+    target_entry.place(x=70, y=40)
 
-    # 5. 消息输入区
-    global input_entry
-    input_entry = tk.Entry(root, width=45)
-    input_entry.place(x=20, y=450)
-    global send_btn
+    query_btn = tk.Button(root, text="查在线", command=query_online_users, state=tk.DISABLED)
+    query_btn.place(x=200, y=38)
+
+    friend_req_btn = tk.Button(root, text="加好友", command=send_friend_req, state=tk.DISABLED)
+    friend_req_btn.place(x=270, y=38)
+
+    # 3. 聊天标题（新增：显示当前聊天对象）
+    chat_title_label = tk.Label(root, text="当前聊天：未选择好友", font=("微软雅黑", 10, "bold"))
+    chat_title_label.place(x=10, y=70)
+
+    # 4. 聊天框（中间）
+    chat_text = tk.Text(root, state=tk.DISABLED, width=68, height=18)
+    chat_text.place(x=10, y=95)
+
+    # 5. 输入框 + 发送按钮（底部）
+    input_entry = tk.Entry(root, width=60)
+    input_entry.place(x=10, y=430)
+
     send_btn = tk.Button(root, text="发送", command=send_msg, state=tk.DISABLED)
-    send_btn.place(x=430, y=448)
+    send_btn.place(x=460, y=428)
 
-    # 6. 通讯录显示区（右侧）
-    tk.Label(root, text="通讯录（按字母排序）").place(x=480, y=20)
-    global friend_listbox
-    friend_listbox = tk.Listbox(root, width=18, height=22)
-    friend_listbox.place(x=480, y=50)
+    # 6. 通讯录（右侧）
+    tk.Label(root, text="通讯录", font=("微软雅黑", 10, "bold")).place(x=510, y=10)
+    friend_listbox = tk.Listbox(root, width=12, height=23)
+    friend_listbox.place(x=510, y=35)
 
-    # 选中好友自动填充目标用户
+    # 新增：点击通讯录切换聊天对象
     def select_friend(event):
         try:
-            selected = friend_listbox.get(friend_listbox.curselection())
-            target_entry.delete(0, tk.END)
-            target_entry.insert(0, selected)
-        except:
-            pass
+            selected_indices = friend_listbox.curselection()
+            if selected_indices:
+                index = selected_indices[0]  # 修复：curselection()返回元组，用[0]取索引
+                selected_friend = friend_listbox.get(index)
+                switch_chat_target(selected_friend)
+        except Exception as e:
+            print(f"切换聊天对象异常：{e}")
 
     friend_listbox.bind("<<ListboxSelect>>", select_friend)
 
-    # 启动GUI主循环
     root.mainloop()
 
 
